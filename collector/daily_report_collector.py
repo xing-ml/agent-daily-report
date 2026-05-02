@@ -207,7 +207,7 @@ def infer_ddgs_region(query: str) -> str:
 
 def search_query(query: str, top_k: int) -> list[SearchResult]:
     region = infer_ddgs_region(query)
-    ddgs = DDGS(timeout=20)
+    ddgs = DDGS(timeout=45)
     raw_results = ddgs.text(
         query,
         region=region,
