@@ -603,6 +603,31 @@ def main() -> int:
             except Exception as exc:
                 search_errors.append({"query": query, "error": repr(exc)})
 
+    # Retry failed queries up to 3 times with 10s delay between attempts
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        if not search_errors:
+            break
+        print(f"[retry] attempt {attempt}/{max_retries}: {len(search_errors)} queries failed, waiting 10s...")
+        time.sleep(10)
+        retry_errors: list[dict] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(search_errors))) as executor:
+            future_map = {
+                executor.submit(search_query, err["query"], args.top_k): err
+                for err in search_errors
+            }
+            for future in concurrent.futures.as_completed(future_map):
+                err = future_map[future]
+                try:
+                    raw_search_results.extend(future.result())
+                except Exception as exc:
+                    retry_errors.append({"query": err["query"], "error": f"retry {attempt}: {repr(exc)}"})
+        if retry_errors:
+            search_errors.extend(retry_errors)
+            print(f"[retry] attempt {attempt}/{max_retries}: {len(retry_errors)} queries still failed")
+        else:
+            print(f"[retry] all queries recovered on attempt {attempt}")
+
     unique_results: dict[str, SearchResult] = {}
     for result in raw_search_results:
         existing = unique_results.get(result.normalized_url)
