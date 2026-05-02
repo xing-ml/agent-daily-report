@@ -35,7 +35,7 @@ QUERIES=(
 ARGS=(
   --task-name international_affairs
   --top-k 10
-  --final-event-cap 12
+  --final-event-cap 20
   --output-dir "$TEMP_DIR"
   --max-content-chars 4500
 )

@@ -33,7 +33,7 @@ QUERIES=(
 ARGS=(
   --task-name ai_model
   --top-k 10
-  --final-event-cap 12
+  --final-event-cap 20
   --output-dir "$TEMP_DIR"
   --max-content-chars 4000
 )
