@@ -33,7 +33,7 @@ QUERIES=(
 ARGS=(
   --task-name headhunter
   --top-k 10
-  --final-event-cap 20
+  --final-event-cap 12
   --output-dir "$TEMP_DIR"
   --max-content-chars 3500
 )

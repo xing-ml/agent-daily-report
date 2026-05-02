@@ -16,10 +16,10 @@ from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from ddgs import DDGS
 from readability import Document
 
 
-DUCKDUCKGO_HTML_URL = "https://html.duckduckgo.com/html/"
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -177,61 +177,70 @@ def extract_domain(url: str) -> str:
     return urlparse(url).netloc.lower()
 
 
-def search_query(session: requests.Session, query: str, top_k: int) -> list[SearchResult]:
-    response = session.post(
-        DUCKDUCKGO_HTML_URL,
-        data={"q": query},
-        timeout=30,
+def infer_ddgs_region(query: str) -> str:
+    if re.search(r"[\u3040-\u30ff]", query):
+        return "jp-jp"
+    if re.search(r"[\uac00-\ud7af]", query):
+        return "kr-kr"
+    if re.search(r"[\u4e00-\u9fff]", query):
+        return "cn-zh"
+    if re.search(r"[\u0400-\u04ff]", query):
+        return "ru-ru"
+    if re.search(r"[àâçéèêëîïôûùüÿñæœ]", query, flags=re.IGNORECASE):
+        return "fr-fr"
+    if re.search(r"[áéíñóúü¡¿]", query, flags=re.IGNORECASE):
+        return "es-es"
+    if re.search(r"[ãõáâàçéêíóôõú]", query, flags=re.IGNORECASE):
+        return "pt-pt"
+    if re.search(r"[ğüşöçıİ]", query, flags=re.IGNORECASE):
+        return "tr-tr"
+    if re.search(r"[\u0590-\u05ff]", query):
+        return "wt-wt"
+    if re.search(r"[\u0600-\u06ff]", query):
+        return "wt-wt"
+    if re.search(r"[\u0900-\u097f]", query):
+        return "in-en"
+    if re.search(r"[\u0b80-\u0bff]", query):
+        return "in-en"
+    return "us-en"
+
+
+def search_query(query: str, top_k: int) -> list[SearchResult]:
+    region = infer_ddgs_region(query)
+    ddgs = DDGS(timeout=20)
+    raw_results = ddgs.text(
+        query,
+        region=region,
+        safesearch="moderate",
+        timelimit="m",
+        max_results=top_k,
     )
-    response.raise_for_status()
-    soup = BeautifulSoup(response.text, "html.parser")
     results: list[SearchResult] = []
     seen_urls: set[str] = set()
 
-    selectors = [
-        ".result",
-        ".results_links",
-    ]
-
-    for selector in selectors:
-        for result_node in soup.select(selector):
-            classes = result_node.get("class", [])
-            if any("result--ad" == css_class for css_class in classes):
-                continue
-            link = result_node.select_one(".result__title a, .result__a")
-            if not link:
-                continue
-            title = normalize_whitespace(link.get_text(" ", strip=True))
-            url_node = result_node.select_one(".result__url")
-            raw_url = (
-                url_node.get("href", "").strip()
-                if url_node and url_node.get("href")
-                else link.get("href", "").strip()
+    for item in raw_results:
+        title = normalize_whitespace(item.get("title", ""))
+        raw_url = normalize_whitespace(item.get("href", ""))
+        normalized_url = normalize_url(raw_url)
+        if not title or not normalized_url or not host_allowed(normalized_url):
+            continue
+        if normalized_url in seen_urls:
+            continue
+        snippet = normalize_whitespace(item.get("body", ""))
+        seen_urls.add(normalized_url)
+        results.append(
+            SearchResult(
+                query=query,
+                rank=len(results) + 1,
+                title=title,
+                url=raw_url,
+                normalized_url=normalized_url,
+                domain=extract_domain(normalized_url),
+                snippet=snippet,
             )
-            normalized_url = normalize_url(raw_url)
-            if not title or not normalized_url or not host_allowed(normalized_url):
-                continue
-            if normalized_url in seen_urls:
-                continue
-            snippet_node = result_node.select_one(".result__snippet")
-            snippet = normalize_whitespace(
-                snippet_node.get_text(" ", strip=True) if snippet_node else ""
-            )
-            seen_urls.add(normalized_url)
-            results.append(
-                SearchResult(
-                    query=query,
-                    rank=len(results) + 1,
-                    title=title,
-                    url=raw_url,
-                    normalized_url=normalized_url,
-                    domain=extract_domain(normalized_url),
-                    snippet=snippet,
-                )
-            )
-            if len(results) >= top_k:
-                return results
-
+        )
+        if len(results) >= top_k:
+            break
     return results
 
 
@@ -584,7 +593,7 @@ def main() -> int:
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(args.queries) or 1)) as executor:
         future_map = {
-            executor.submit(search_query, session, query, args.top_k): query
+            executor.submit(search_query, query, args.top_k): query
             for query in args.queries
         }
         for future in concurrent.futures.as_completed(future_map):
