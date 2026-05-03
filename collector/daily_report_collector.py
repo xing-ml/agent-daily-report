@@ -8,6 +8,7 @@ import concurrent.futures
 import json
 import re
 import sys
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
