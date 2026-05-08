@@ -31,10 +31,10 @@ Each shell script in `bin/` defines a task-specific set of search queries (11 pe
 
 ## Environment
 
-All Python tasks run in the `daily_report_env` conda environment:
+All Python tasks run in the `daily-report` conda environment:
 
 ```bash
-conda activate daily_report_env
+conda activate daily-report
 pip install -r requirements.txt
 ```
 

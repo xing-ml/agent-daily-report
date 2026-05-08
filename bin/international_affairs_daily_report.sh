@@ -5,7 +5,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEMP_DIR="$PROJECT_DIR/temp"
-PYTHON_BIN="${DAILY_REPORT_PYTHON:-$HOME/miniconda3/envs/daily_report_env/bin/python3.11}"
+PYTHON_BIN="${DAILY_REPORT_PYTHON:-$HOME/miniconda3/envs/daily-report/bin/python3.11}"
 
 if [ ! -x "$PYTHON_BIN" ]; then
   PYTHON_BIN="${DAILY_REPORT_PYTHON_FALLBACK:-python3.11}"
