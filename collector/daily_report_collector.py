@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 import requests
 from bs4 import BeautifulSoup
 from ddgs import DDGS
-from readability import Document
+from readability.readability import Document
 
 
 HEADERS = {
