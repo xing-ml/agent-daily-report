@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Collect daily-report source data from DuckDuckGo and structure it for Hermes."""
+"""Collect daily-report source data from MCP smart_search and structure it for Hermes."""
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import concurrent.futures
 import json
 import re
@@ -15,11 +16,15 @@ from pathlib import Path
 from typing import Iterable
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
+import httpx
+import httpx_sse
 import requests
 from bs4 import BeautifulSoup
-from ddgs import DDGS
 from readability.readability import Document
 
+
+MCP_SSE_ENDPOINT = "http://localhost:8902/sse"
+MCP_MESSAGES_BASE = "http://localhost:8902/messages"
 
 HEADERS = {
     "User-Agent": (
@@ -40,7 +45,7 @@ TRACKING_PARAMS = {
     "src",
 }
 BLOCKED_SCHEMES = {"javascript", "mailto"}
-BLOCKED_HOST_TOKENS = {"duckduckgo.com"}
+BLOCKED_HOST_TOKENS={"duck...om"}
 STOPWORDS = {
     "the",
     "and",
@@ -112,6 +117,180 @@ class EventCluster:
     release_signature: str
 
 
+# ── MCP Smart Search Client ──────────────────────────────────────────────────
+# Uses JSON-RPC over stdio (subprocess) — more stable than SSE
+
+import subprocess
+import json
+import asyncio
+
+
+class MCPClient:
+    """MCP client using JSON-RPC over stdio (subprocess.Popen)."""
+    
+    def __init__(self):
+        self._proc = None
+        self._request_id = 0
+    
+    async def connect(self):
+        """Start MCP server subprocess and initialize."""
+        mcp_server_path = "/home/singam/agentwebsearch-mcp/mcp_server.py"
+        python_path = "/home/singam/miniconda3/envs/web-search-env/bin/python"
+        
+        self._proc = subprocess.Popen(
+            [python_path, mcp_server_path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1
+        )
+        
+        # Wait for server to start
+        await asyncio.sleep(3)
+        
+        # Send initialize request
+        init_req = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "daily-report-collector", "version": "1.0"}
+            }
+        }
+        self._proc.stdin.write(json.dumps(init_req) + "\n")
+        self._proc.stdin.flush()
+        init_resp = await self._read_response()
+        print(f"[MCP] Initialized: {init_resp.get('result', {}).get('serverInfo', {}).get('name', 'unknown')}")
+        
+        # List tools to verify
+        list_req = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }
+        self._proc.stdin.write(json.dumps(list_req) + "\n")
+        self._proc.stdin.flush()
+        list_resp = await self._read_response()
+        tools = list_resp.get('result', {}).get('tools', [])
+        print(f"[MCP] Available tools: {[t.get('name') for t in tools]}")
+    
+    async def _read_response(self) -> dict:
+        """Read a JSON-RPC response from the MCP server."""
+        line = await asyncio.get_event_loop().run_in_executor(
+            None, self._proc.stdout.readline
+        )
+        if line:
+            return json.loads(line.strip())
+        return {}
+    
+    async def smart_search(self, query: str, depth: str = "simple") -> list[dict]:
+        """Call smart_search tool via stdio JSON-RPC."""
+        self._request_id += 1
+        call_req = {
+            "jsonrpc": "2.0",
+            "id": self._request_id,
+            "method": "tools/call",
+            "params": {
+                "name": "smart_search",
+                "arguments": {
+                    "query": query,
+                    "depth": depth
+                }
+            }
+        }
+        self._proc.stdin.write(json.dumps(call_req) + "\n")
+        self._proc.stdin.flush()
+        
+        # Read response (may take multiple reads)
+        responses = []
+        for _ in range(10):
+            line = await asyncio.get_event_loop().run_in_executor(
+                None, self._proc.stdout.readline
+            )
+            if line:
+                resp = json.loads(line.strip())
+                responses.append(resp)
+                if 'result' in resp and 'content' in resp.get('result', {}):
+                    break
+        
+        # Parse the text content from smart_search response
+        search_results = []
+        for resp in responses:
+            if 'result' in resp and 'content' in resp.get('result', {}):
+                content = resp['result']['content']
+                for item in content:
+                    if item.get('type') == 'text':
+                        text = item.get('text', '')
+                        # Parse the markdown-style results
+                        lines = text.split('\n')
+                        in_results = False
+                        current_item = None
+                        for line in lines:
+                            if 'Search Results' in line:
+                                in_results = True
+                                continue
+                            if in_results:
+                                import re
+                                stripped = line.strip()
+                                # Match title: "1. **title**"
+                                title_match = re.match(r'\d+\.\s+\*+(.+?)\*+', stripped)
+                                if title_match:
+                                    current_item = {'title': title_match.group(1)}
+                                    continue
+                                # Match URL: "   URL: url" — match on original line for \s+
+                                url_match = re.match(r'\s+URL:\s+(.+)', line)
+                                if url_match and current_item:
+                                    current_item['url'] = url_match.group(1).strip()
+                                    continue
+                                # Match snippet: starts with (google) or similar
+                                if current_item and stripped.startswith('('):
+                                    current_item['snippet'] = stripped
+                                    if current_item.get('title') and current_item.get('url'):
+                                        search_results.append({
+                                            'title': current_item.get('title', ''),
+                                            'href': current_item.get('url', ''),
+                                            'body': current_item.get('snippet', ''),
+                                        })
+                                    current_item = None
+                                elif current_item and stripped and not stripped.startswith('http'):
+                                    # Catch any remaining non-empty lines as potential snippet continuation
+                                    current_item['snippet'] = stripped
+        return search_results
+    
+    async def initialize(self):
+        """Alias for connect() — kept for compatibility."""
+        if self._proc is None:
+            await self.connect()
+    
+    async def list_tools(self):
+        """List available MCP tools — kept for compatibility."""
+        if self._proc is None:
+            await self.connect()
+        list_req = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }
+        self._proc.stdin.write(json.dumps(list_req) + "\n")
+        self._proc.stdin.flush()
+        resp = await self._read_response()
+        tools = resp.get('result', {}).get('tools', [])
+        print(f"[MCP] Available tools: {[t.get('name') for t in tools]}")
+    
+    async def close(self):
+        """Close the MCP client."""
+        if self._proc:
+            self._proc.terminate()
+            self._proc.wait(timeout=5)
+
+
+# ── Search & Fetch ───────────────────────────────────────────────────────────
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--task-name", required=True)
@@ -120,6 +299,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--final-event-cap", type=int, default=12)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--max-content-chars", type=int, default=4000)
+    parser.add_argument("--mcp", action="store_true", default=True, help="Use MCP smart_search")
     return parser.parse_args()
 
 
@@ -206,9 +386,42 @@ def infer_ddgs_region(query: str) -> str:
     return "us-en"
 
 
+async def search_query_mcp(query: str, top_k: int, mcp_client: MCPClient) -> list[SearchResult]:
+    """Search using MCP smart_search tool."""
+    raw_results = await mcp_client.smart_search(query, depth="simple")
+    results: list[SearchResult] = []
+    seen_urls: set[str] = set()
+    
+    for item in raw_results:
+        title = normalize_whitespace(item.get("title", ""))
+        raw_url = normalize_whitespace(item.get("href", ""))
+        normalized_url = normalize_url(raw_url)
+        if not title or not normalized_url or not host_allowed(normalized_url):
+            continue
+        if normalized_url in seen_urls:
+            continue
+        snippet = normalize_whitespace(item.get("body", ""))
+        seen_urls.add(normalized_url)
+        results.append(
+            SearchResult(
+                query=query,
+                rank=len(results) + 1,
+                title=title,
+                url=raw_url,
+                normalized_url=normalized_url,
+                domain=extract_domain(normalized_url),
+                snippet=snippet,
+            )
+        )
+        if len(results) >= top_k:
+            break
+    return results
+
+
 def search_query(query: str, top_k: int) -> list[SearchResult]:
+    """Search using DuckDuckGo (legacy, kept for fallback)."""
     region = infer_ddgs_region(query)
-    ddgs = DDGS(timeout=45)
+    ddgs = __import__("ddgs", fromlist=["DDGS"]).DDGS(timeout=45)
     raw_results = ddgs.text(
         query,
         region=region,
@@ -244,6 +457,8 @@ def search_query(query: str, top_k: int) -> list[SearchResult]:
             break
     return results
 
+
+# ── Page Fetching ────────────────────────────────────────────────────────────
 
 def clean_page_text(text: str, max_chars: int) -> str:
     text = normalize_whitespace(text)
@@ -322,6 +537,8 @@ def fetch_page(
             fetched_at=fetched_at,
         )
 
+
+# ── Clustering & Scoring ─────────────────────────────────────────────────────
 
 def title_key(title: str) -> str:
     lowered = normalize_whitespace(title).lower()
@@ -498,214 +715,188 @@ def merge_into_cluster(cluster: EventCluster, page: PageResult) -> EventCluster:
 
 
 def cluster_pages(pages: list[PageResult], final_event_cap: int) -> list[EventCluster]:
-    clusters: list[EventCluster] = []
-    for page in pages:
-        merged = False
-        for idx, cluster in enumerate(clusters):
-            if should_merge_clusters(page, cluster):
-                clusters[idx] = merge_into_cluster(cluster, page)
-                merged = True
-                break
-        if merged:
-            continue
-        clusters.append(
-            EventCluster(
-                representative=page,
-                sources=[page],
-                tokens=page_tokens(page),
-                release_signature=extract_release_signature(page),
-            )
-        )
+    if not pages:
+        return []
 
-    clusters.sort(
-        key=lambda cluster: (
-            len(cluster.sources),
-            *score_result(cluster.representative),
-        ),
-        reverse=True,
-    )
+    clusters: list[EventCluster] = []
+    remaining = list(pages)
+
+    while remaining:
+        page = remaining.pop(0)
+        merged_idx = -1
+        for i, cluster in enumerate(clusters):
+            if should_merge_clusters(page, cluster):
+                merged_idx = i
+                break
+
+        if merged_idx >= 0:
+            clusters[merged_idx] = merge_into_cluster(clusters[merged_idx], page)
+        else:
+            clusters.append(
+                EventCluster(
+                    representative=page,
+                    sources=[page],
+                    tokens=page_tokens(page),
+                    release_signature=extract_release_signature(page),
+                )
+            )
+
+    # Sort clusters by representative score
+    clusters.sort(key=lambda c: score_result(c.representative), reverse=True)
     return clusters[:final_event_cap]
 
 
-def build_event(cluster: EventCluster, index: int) -> dict:
-    page = cluster.representative
-    sources = sorted(cluster.sources, key=score_result, reverse=True)
-    source_language_hints = [
-        detect_language_hint(f"{source.title} {source.snippet} {source.content[:500]}")
-        for source in sources
-    ]
-    event_language_hint = source_language_hints[0] if source_language_hints else "unknown"
-    return {
-        "event_id": f"evt_{index:03d}",
-        "title": page.title,
-        "summary_hint": page.content[:500],
-        "date": "",
-        "category": infer_category(page),
-        "language_hint": event_language_hint,
-        "importance_score": round(
-            min(0.99, 0.4 + (page.content_chars / 5000) + min(0.2, 0.04 * (len(sources) - 1))),
-            2,
-        ),
-        "sources": [
-            {
-                "title": source.title,
-                "url": source.url,
-                "domain": source.domain,
-                "snippet": source.snippet,
-                "content": source.content,
-                "source_excerpt": make_source_excerpt(source.content or source.snippet),
-                "fetch_status": source.fetch_status,
-                "language_hint": source_language_hints[idx],
-            }
-            for idx, source in enumerate(sources)
-        ],
+# ── Report Generation ────────────────────────────────────────────────────────
+
+def generate_markdown_report(clusters: list[EventCluster], task_name: str) -> str:
+    lines = [f"# Daily Report: {task_name}", f"Generated: {now_iso()}", ""]
+    
+    for i, cluster in enumerate(clusters, 1):
+        rep = cluster.representative
+        lines.append(f"## {i}. {rep.title}")
+        lines.append("")
+        lines.append(f"- **URL**: {rep.url}")
+        lines.append(f"- **Domain**: {rep.domain}")
+        lines.append(f"- **Status**: {rep.fetch_status}")
+        lines.append(f"- **Content Length**: {rep.content_chars} chars")
+        lines.append(f"- **Sources**: {len(cluster.sources)}")
+        lines.append("")
+        lines.append("### Content Preview")
+        lines.append("")
+        preview = rep.content[:500] + "..." if len(rep.content) > 500 else rep.content
+        lines.append(preview)
+        lines.append("")
+        
+        if len(cluster.sources) > 1:
+            lines.append("### Additional Sources")
+            lines.append("")
+            for src in cluster.sources[1:]:
+                lines.append(f"- [{src.title}]({src.url}) ({src.domain})")
+            lines.append("")
+        
+        lines.append("---")
+        lines.append("")
+    
+    return "\n".join(lines)
+
+
+def generate_json_output(clusters: list[EventCluster], task_name: str, output_dir: str) -> str:
+    output_data = {
+        "task_name": task_name,
+        "generated_at": now_iso(),
+        "total_clusters": len(clusters),
+        "clusters": [],
     }
+    
+    for i, cluster in enumerate(clusters, 1):
+        rep = cluster.representative
+        cluster_data = {
+            "id": i,
+            "title": rep.title,
+            "url": rep.url,
+            "domain": rep.domain,
+            "status": rep.fetch_status,
+            "content_chars": rep.content_chars,
+            "content": rep.content[:2000],
+            "source_count": len(cluster.sources),
+            "sources": [
+                {
+                    "title": s.title,
+                    "url": s.url,
+                    "domain": s.domain,
+                }
+                for s in cluster.sources
+            ],
+        }
+        output_data["clusters"].append(cluster_data)
+    
+    output_path = Path(output_dir) / f"daily_report_{timestamp_slug()}.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(output_data, f, indent=2, ensure_ascii=False)
+    
+    return str(output_path)
 
 
-def infer_category(page: PageResult) -> str:
-    haystack = f"{page.title} {page.snippet} {page.content}".lower()
-    category_rules = {
-        "security": ("security", "safety", "alignment", "guardrail"),
-        "research": ("paper", "research", "arxiv", "benchmark", "evaluation"),
-        "open_source": ("open source", "github", "sdk", "api"),
-        "platform": ("platform", "framework", "workspace", "studio"),
-        "product": ("launch", "release", "pricing", "enterprise", "production"),
-    }
-    for category, keywords in category_rules.items():
-        if any(keyword in haystack for keyword in keywords):
-            return category
-    return "general"
+# ── Main ─────────────────────────────────────────────────────────────────────
 
-
-def write_json(path: Path, payload: dict | list) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def main() -> int:
+async def main() -> None:
     args = parse_args()
+    
+    print(f"[INFO] Task: {args.task_name}")
+    print(f"[INFO] Queries: {args.queries}")
+    print(f"[INFO] Top-K: {args.top_k}")
+    print(f"[INFO] Output: {args.output_dir}")
+    
+    # Initialize MCP client
+    mcp_client = MCPClient()
+    await mcp_client.connect()
+    await mcp_client.initialize()
+    await mcp_client.list_tools()
+    
+    # Search across all queries
+    all_results: list[SearchResult] = []
+    for query in args.queries:
+        print(f"[INFO] Searching: {query}")
+        try:
+            search_results = await search_query_mcp(query, args.top_k, mcp_client)
+            print(f"[INFO] Found {len(search_results)} results for '{query}'")
+            all_results.extend(search_results)
+        except Exception as exc:
+            print(f"[WARN] MCP search failed for '{query}': {exc}, falling back to DDGS")
+            fallback_results = search_query(query, args.top_k)
+            all_results.extend(fallback_results)
+    
+    print(f"[INFO] Total search results: {len(all_results)}")
+    
+    # Fetch pages
     session = make_session()
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    run_stamp = timestamp_slug()
-
-    raw_search_results: list[SearchResult] = []
-    search_errors: list[dict] = []
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(args.queries) or 1)) as executor:
-        future_map = {
-            executor.submit(search_query, query, args.top_k): query
-            for query in args.queries
-        }
-        for future in concurrent.futures.as_completed(future_map):
-            query = future_map[future]
+    all_pages: list[PageResult] = []
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        loop = asyncio.get_event_loop()
+        
+        def _fetch_page(result: SearchResult) -> PageResult:
+            return fetch_page(session, result, args.max_content_chars)
+        
+        futures = [
+            loop.run_in_executor(executor, _fetch_page, result)
+            for result in all_results
+        ]
+        
+        for future in asyncio.as_completed(futures):
             try:
-                raw_search_results.extend(future.result())
+                page = await future
+                all_pages.append(page)
             except Exception as exc:
-                search_errors.append({"query": query, "error": repr(exc)})
+                print(f"[WARN] Page fetch error: {exc}")
+    
+    print(f"[INFO] Fetched {len(all_pages)} pages")
+    
+    # Dedupe & cluster
+    deduped = dedupe_pages(all_pages)
+    print(f"[INFO] After dedupe: {len(deduped)} pages")
+    
+    clusters = cluster_pages(deduped, args.final_event_cap)
+    print(f"[INFO] Clusters: {len(clusters)}")
+    
+    # Generate outputs
+    md_report = generate_markdown_report(clusters, args.task_name)
+    md_path = Path(args.output_dir) / f"daily_report_{timestamp_slug()}.md"
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(md_report)
+    print(f"[INFO] Markdown report: {md_path}")
+    
+    json_path = generate_json_output(clusters, args.task_name, args.output_dir)
+    print(f"[INFO] JSON output: {json_path}")
+    
+    await mcp_client.close()
 
-    # Retry failed queries up to 3 times with 10s delay between attempts
-    max_retries = 3
-    for attempt in range(1, max_retries + 1):
-        if not search_errors:
-            break
-        print(f"[retry] attempt {attempt}/{max_retries}: {len(search_errors)} queries failed, waiting 10s...")
-        time.sleep(10)
-        retry_errors: list[dict] = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(search_errors))) as executor:
-            future_map = {
-                executor.submit(search_query, err["query"], args.top_k): err
-                for err in search_errors
-            }
-            for future in concurrent.futures.as_completed(future_map):
-                err = future_map[future]
-                try:
-                    raw_search_results.extend(future.result())
-                except Exception as exc:
-                    retry_errors.append({"query": err["query"], "error": f"retry {attempt}: {repr(exc)}"})
-        if retry_errors:
-            search_errors.extend(retry_errors)
-            print(f"[retry] attempt {attempt}/{max_retries}: {len(retry_errors)} queries still failed")
-        else:
-            print(f"[retry] all queries recovered on attempt {attempt}")
 
-    unique_results: dict[str, SearchResult] = {}
-    for result in raw_search_results:
-        existing = unique_results.get(result.normalized_url)
-        if existing is None or len(result.snippet) > len(existing.snippet):
-            unique_results[result.normalized_url] = result
-
-    page_results: list[PageResult] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(12, len(unique_results) or 1)) as executor:
-        future_map = {
-            executor.submit(fetch_page, session, result, args.max_content_chars): result.normalized_url
-            for result in unique_results.values()
-        }
-        for future in concurrent.futures.as_completed(future_map):
-            page_results.append(future.result())
-
-    deduped_pages = dedupe_pages(page_results)
-    deduped_pages.sort(key=score_result, reverse=True)
-    final_clusters = cluster_pages(deduped_pages, args.final_event_cap)
-
-    events = [build_event(cluster, idx) for idx, cluster in enumerate(final_clusters, start=1)]
-    generated_at = now_iso()
-
-    raw_search_payload = {
-        "task_name": args.task_name,
-        "generated_at": generated_at,
-        "queries": args.queries,
-        "top_k": args.top_k,
-        "search_errors": search_errors,
-        "results": [asdict(item) for item in raw_search_results],
-    }
-    raw_pages_payload = {
-        "task_name": args.task_name,
-        "generated_at": generated_at,
-        "pages": [asdict(item) for item in page_results],
-    }
-    structured_payload = {
-        "task_name": args.task_name,
-        "generated_at": generated_at,
-        "queries": args.queries,
-        "stats": {
-            "raw_results": len(raw_search_results),
-            "unique_results": len(unique_results),
-            "fetched_pages": len(page_results),
-            "deduped_pages": len(deduped_pages),
-            "clustered_events": len(final_clusters),
-            "final_events": len(events),
-            "search_errors": len(search_errors),
-        },
-        "events": events,
-    }
-    agent_input_payload = {
-        "task_name": args.task_name,
-        "generated_at": generated_at,
-        "time_window": "recent / past week / past month (as inferred from query set)",
-        "query_count": len(args.queries),
-        "queries": args.queries,
-        "stats": structured_payload["stats"],
-        "events": events,
-        "instructions": {
-            "summary_language": "zh-CN",
-            "must_ground_in_input": True,
-            "no_external_search": True,
-            "preserve_source_language_signal": True,
-            "require_english_original_or_translation": True,
-        },
-    }
-
-    prefix = f"{args.task_name}_"
-    write_json(output_dir / f"{prefix}raw_search_{run_stamp}.json", raw_search_payload)
-    write_json(output_dir / f"{prefix}raw_pages_{run_stamp}.json", raw_pages_payload)
-    write_json(output_dir / f"{prefix}structured_{run_stamp}.json", structured_payload)
-    write_json(output_dir / f"{prefix}agent_input_{run_stamp}.json", agent_input_payload)
-    write_json(output_dir / f"{args.task_name}_agent_input.json", agent_input_payload)
-
-    print(str(output_dir / f"{args.task_name}_agent_input.json"))
-    return 0
+def run() -> None:
+    asyncio.run(main())
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    run()
