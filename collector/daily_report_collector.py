@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import concurrent.futures
 import json
+import os
 import re
 import sys
 import time
@@ -15,6 +16,32 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
+
+# ── Project root (agent-daily-report/) ────────────────────────────────────────
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+
+
+# ── MCP path resolution (portable across machines) ────────────────────────────
+def get_mcp_server_path() -> Path:
+    """Resolve MCP server path: env var → project-relative → error."""
+    env_path = os.environ.get("MCP_SERVER_PATH")
+    if env_path:
+        return Path(env_path)
+    local = PROJECT_DIR.parent / "agentwebsearch-mcp" / "mcp_server.py"
+    if local.exists():
+        return local
+    raise FileNotFoundError(
+        "MCP server not found. Set MCP_SERVER_PATH env var or place "
+        "agentwebsearch-mcp/ alongside agent-daily-report/"
+    )
+
+
+def get_python_path() -> str:
+    """Resolve Python interpreter: env var → current interpreter."""
+    env_path = os.environ.get("MCP_PYTHON_PATH")
+    if env_path:
+        return env_path
+    return sys.executable
 
 import httpx
 import httpx_sse
@@ -134,8 +161,8 @@ class MCPClient:
     
     async def connect(self):
         """Start MCP server subprocess and initialize."""
-        mcp_server_path = "/home/singam/agentwebsearch-mcp/mcp_server.py"
-        python_path = "/home/singam/miniconda3/envs/web-search-env/bin/python"
+        mcp_server_path = str(get_mcp_server_path())
+        python_path = get_python_path()
         
         self._proc = subprocess.Popen(
             [python_path, mcp_server_path],
